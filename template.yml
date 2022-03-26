@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: AWS-EventBridge
+
+Globals:
+  Function:
+    Runtime: java11
+    MemorySize: 3072
+    Timeout: 25
+
+  Api:
+    OpenApiVersion: '3.0.1'
+
+Resources:
+
+  PaymentsAPIGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Name: PaymentsAPIGateway
+
+  Payments:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Payments
+      Handler: com.ibercode.payments.Payments::handleRequest
+      CodeUri: target/sourceCode.zip
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref PaymentsEventBus
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref PaymentsEventBus
+      Events:
+        ApiEvents:
+          Type: Api
+          Properties:
+            Path: /payments
+            Method: POST
+            RestApiId: !Ref PaymentsAPIGateway
+
+  Customer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Customer
+      Handler: com.ibercode.customer.Customer::handleRequest
+      CodeUri: target/sourceCode.zip
+      Environment:
+        Variables:
+          CUSTOMER_TABLE: !Ref CustomerPaymentsDDB
+      Policies:
+        - AmazonDynamoDBFullAccess
+
+  Sales:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sales
+      Handler: com.ibercode.sales.Sales::handleRequest
+      CodeUri: target/sourceCode.zip
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          SALES_TABLE: !Ref SalesDynamoDB
+
+  PaymentsEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: PaymentsEventBus
+
+  CustomerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentCustomerRule
+      EventBusName: !GetAtt PaymentsEventBus.Arn
+      Targets:
+        - Arn: !GetAtt Customer.Arn
+          Id: "PaymentCustomerRule"
+      EventPattern:
+        source:
+          - "com.ibercode.payments"
+        detail-type:
+          - "customer"
+
+  SalesEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentSalesRule
+      EventBusName: !GetAtt PaymentsEventBus.Arn
+      Targets:
+        - Arn: !GetAtt Sales.Arn
+          Id: "PaymentSalesRule"
+      EventPattern:
+        source:
+          - "com.ibercode.payments"
+        detail-type:
+          - "sales"
+
+  SNSEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SNSEventRule
+      EventBusName: !GetAtt PaymentsEventBus.Arn
+      Targets:
+        - Arn: !Ref PaymentsSNS
+          Id: "PaymentsTopic"
+      EventPattern:
+        source:
+          - "com.ibercode.payments"
+        detail-type:
+          - "email"
+
+  PaymentsSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PaymentsSNSTopic
+
+  #DynamoDB
+  CustomerPaymentsDDB:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: CustomerPayments
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+    # DynamoDB Table
+  SalesDynamoDB:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: Sales
+      AttributeDefinitions:
+        - AttributeName: saleId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: saleId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  #Permissions
+  EventBridgeToToSnsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PaymentsSNS
+      Topics:
+        - !Ref PaymentsSNS
+
+  PaymentsEventBusInvokeCustomerLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Customer
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CustomerEventRule.Arn
+
+  PaymentsEventBusInvokeSalesLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Sales
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt SalesEventRule.Arn
+
+Outputs:
+  PaymentsEndpoint:
+    Description: API Gateway Payments Endpoint
+    Value:
+      Fn::Sub: https://${PaymentsAPIGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/payments
